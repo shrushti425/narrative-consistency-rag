@@ -1,111 +1,74 @@
+"""
+main.py
+-------
+Sanity-check + demo entrypoint for Narrative Consistency system
+Uses Pathway-backed retrieval (Track A compliant)
+"""
+
 from pathlib import Path
-import pandas as pd
-import numpy as np
 import nltk
 from sentence_transformers import SentenceTransformer
-import faiss
 
-nltk.download("punkt")
-nltk.download("punkt_tab")
+from pathway_store import build_index
+from run_inference import (
+    load_text,
+    chunk_text,
+    extract_claims,
+    classify_claim,
+    aggregate_verdicts,
+)
 
-# ---------- Helpers ----------
-def load_text(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+# ---------------- SETUP ----------------
+nltk.download("punkt", quiet=True)
+model = SentenceTransformer("all-MiniLM-L6-v2")
 
-def chunk_text(text, chunk_size=500, overlap=100):
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start = end - overlap
-    return chunks
-
-def extract_claims(backstory):
-    return nltk.sent_tokenize(backstory)
-
-def classify_claim(claim, evidence_chunks):
-    claim_lower = claim.lower()
-
-    support_signals = ["trusted", "leader", "led", "fearless", "brave"]
-    contradiction_signals = ["afraid", "feared", "avoided", "hesitant", "distrusted"]
-
-    score = 0
-
-    for chunk in evidence_chunks:
-        text = chunk.lower()
-
-        for w in support_signals:
-            if w in claim_lower and w in text:
-                score += 1
-
-        for w in contradiction_signals:
-            if w in claim_lower and w in text:
-                score -= 1
-
-    if score > 0:
-        return "SUPPORTED"
-    elif score < 0:
-        return "CONTRADICTED"
-    else:
-        return "UNCLEAR"
-
-def aggregate_verdicts(verdicts):
-    if "CONTRADICTED" in verdicts:
-        return 0
-    return 1
-
-# ---------- MAIN ----------
+# ---------------- DEMO RUN ----------------
 if __name__ == "__main__":
-    df = pd.read_csv("data/train.csv")
-    row = df.iloc[0]
 
-    book_name = row["book_name"]
-    backstory = row["content"]
+    # ---- Example input (single case demo) ----
+    book_name = "The Count of Monte Cristo"
+    backstory = (
+        "Edmond Dantès was always trusted by his peers and showed fearless "
+        "leadership early in his career."
+    )
 
     print("\n📘 Book:", book_name)
     print("🧾 Backstory:", backstory)
 
+    # ---- Load novel ----
     book_path = Path(f"data/books/{book_name}.txt")
     novel_text = load_text(book_path)
 
+    # ---- Chunk + Pathway index ----
     chunks = chunk_text(novel_text)
-    print(f"\n📚 Total novel chunks: {len(chunks)}")
+    pathway_index = build_index({book_name: chunks})
 
-    model = SentenceTransformer("all-MiniLM-L6-v2")
-    chunk_embeddings = model.encode(chunks)
-    chunk_embeddings = np.array(chunk_embeddings).astype("float32")
-
-    index = faiss.IndexFlatL2(chunk_embeddings.shape[1])
-    index.add(chunk_embeddings)
-
+    # ---- Claim extraction ----
     claims = extract_claims(backstory)
+    verdicts = []
 
-    print("\n📜 Extracted Claims:")
-    for i, c in enumerate(claims, 1):
-        print(f"{i}. {c}")
+    print("\n📜 Claims:")
+    for c in claims:
+        print(" -", c)
 
-    print("\n🔍 Evidence & Verdicts:")
-    claim_verdicts = []
-
+    # ---- Evidence retrieval + reasoning ----
     for claim in claims:
+        query_emb = model.encode(claim).tolist()
+        results = pathway_index.query(query_emb)
+
+        evidence_chunks = [r["chunk"] for r in results]
+        verdict = classify_claim(claim, evidence_chunks)
+        verdicts.append(verdict)
+
         print(f"\nCLAIM → {claim}")
-
-        query_emb = model.encode([claim]).astype("float32")
-        _, idxs = index.search(query_emb, k=5)
-
-        evidence = [chunks[i] for i in idxs[0]]
-        verdict = classify_claim(claim, evidence)
-        claim_verdicts.append(verdict)
-
-        print("VERDICT:", verdict)
+        print("VERDICT →", verdict)
         print("EVIDENCE:")
-        for ev in evidence:
-            print(" •", ev[:200].replace("\n", " "))
+        for ev in evidence_chunks[:2]:
+            print(" •", ev[:180].replace("\n", " "))
 
-    final_label = aggregate_verdicts(claim_verdicts)
+    # ---- Final decision ----
+    final_label = aggregate_verdicts(verdicts)
 
-    print("\n📊 Claim Verdicts:", claim_verdicts)
-    print("🏁 FINAL PREDICTION:", final_label)
+    print("\n📊 Claim Verdicts:", verdicts)
+    print("🏁 FINAL CONSISTENCY LABEL:", final_label)
 
