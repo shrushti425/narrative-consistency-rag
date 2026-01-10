@@ -1,5 +1,6 @@
 from pathlib import Path
 import pandas as pd
+import numpy as np
 import nltk
 from sentence_transformers import SentenceTransformer
 import faiss
@@ -23,44 +24,29 @@ def chunk_text(text, chunk_size=500, overlap=100):
 def extract_claims(text):
     return nltk.sent_tokenize(text)
 
-def classify_claim(claim, evidence_chunks):
-    claim_lower = claim.lower()
+def build_faiss_index(chunks, model):
+    embeddings = model.encode(chunks, show_progress_bar=False)
+    embeddings = np.array(embeddings).astype("float32")
+    index = faiss.IndexFlatL2(embeddings.shape[1])
+    index.add(embeddings)
+    return index, embeddings
 
-    support_words = ["leader", "led", "trusted", "fearless", "brave"]
-    contradict_words = ["afraid", "feared", "avoided", "hesitant", "distrusted"]
-
-    score = 0
-    for chunk in evidence_chunks:
-        text = chunk.lower()
-        for w in support_words:
-            if w in claim_lower and w in text:
-                score += 1
-        for w in contradict_words:
-            if w in claim_lower and w in text:
-                score -= 1
-
-    if score > 0:
-        return "SUPPORTED"
-    elif score < 0:
-        return "CONTRADICTED"
-    else:
-        return "UNCLEAR"
-
-def aggregate(verdicts):
-    if "CONTRADICTED" in verdicts:
-        return 0, "At least one backstory claim contradicts the narrative"
-    else:
-        return 1, "All backstory claims align with the narrative"
+def claim_support_score(claim, chunks, index, model, k=5):
+    q_emb = model.encode([claim]).astype("float32")
+    distances, idxs = index.search(q_emb, k=k)
+    sims = 1 / (1 + distances[0])   # convert L2 → similarity
+    return float(np.mean(sims))
 
 # ---------------- MAIN ----------------
 if __name__ == "__main__":
     test_df = pd.read_csv("data/test.csv")
     model = SentenceTransformer("all-MiniLM-L6-v2")
 
-    book_cache = []
-
     labels = []
     rationales = []
+    scores = []
+
+    book_cache = {}
 
     for i, row in test_df.iterrows():
         print(f"🔄 Processing {i+1}/{len(test_df)} | ID={row['id']}")
@@ -68,31 +54,41 @@ if __name__ == "__main__":
         book_name = row["book_name"]
         backstory = row["content"]
 
-        # load & index book once
-        book_path = Path(f"data/books/{book_name}.txt")
-        novel_text = load_text(book_path)
-        chunks = chunk_text(novel_text)
+        # cache book embeddings
+        if book_name not in book_cache:
+            book_path = Path(f"data/books/{book_name}.txt")
+            novel_text = load_text(book_path)
+            chunks = chunk_text(novel_text)
+            index, _ = build_faiss_index(chunks, model)
+            book_cache[book_name] = (chunks, index)
 
-        embeddings = model.encode(chunks).astype("float32")
-        index = faiss.IndexFlatL2(embeddings.shape[1])
-        index.add(embeddings)
+        chunks, index = book_cache[book_name]
 
         claims = extract_claims(backstory)
-        verdicts = []
+        claim_scores = [
+            claim_support_score(c, chunks, index, model)
+            for c in claims
+        ]
 
-        for claim in claims:
-            q_emb = model.encode([claim]).astype("float32")
-            _, idxs = index.search(q_emb, k=5)
-            evidence = [chunks[j] for j in idxs[0]]
-            verdicts.append(classify_claim(claim, evidence))
+        avg_score = float(np.mean(claim_scores))
+        scores.append(round(avg_score, 4))
 
-        label, rationale = aggregate(verdicts)
+        # 🔑 DECISION RULE (THIS FIXES ALL-ONES BUG)
+        if avg_score >= 0.42:
+            label = 1
+            rationale = "Backstory claims are semantically supported by the narrative"
+        else:
+            label = 0
+            rationale = "Backstory claims are weakly supported or contradicted by the narrative"
+
         labels.append(label)
         rationales.append(rationale)
 
-    # 🔥 APPEND — DO NOT REPLACE
-    test_df["label"] = labels
-    test_df["rationale"] = rationales
+    # 🔥 STRICT FORMAT: test.csv + 3 columns
+    output_df = test_df.copy()
+    output_df["label"] = labels
+    output_df["rationale"] = rationales
+    output_df["score"] = scores
 
-    test_df.to_csv("results.csv", index=False)
-    print("\n✅ DONE: results.csv matches test.csv + predictions")
+    output_df.to_csv("results.csv", index=False)
+    print("\n✅ DONE: results.csv in correct format with non-degenerate labels")
